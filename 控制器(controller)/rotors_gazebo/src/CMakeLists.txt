@@ -53,9 +53,13 @@ catkin_package(
     mav_msgs
     roscpp
     sensor_msgs
+    cv_bridge
 )
 
-include_directories(include ${catkin_INCLUDE_DIRS})
+include_directories(
+  ${catkin_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
+)
 
 add_executable(waypoint_publisher src/waypoint_publisher.cpp)
 target_link_libraries(waypoint_publisher ${catkin_LIBRARIES})
@@ -66,7 +70,10 @@ target_link_libraries(waypoint_publisher_file ${catkin_LIBRARIES})
 add_dependencies(waypoint_publisher_file ${catkin_EXPORTED_TARGETS})
 
 add_executable(hovering_example src/hovering_example.cpp)
-target_link_libraries(hovering_example ${catkin_LIBRARIES})
+target_link_libraries(hovering_example
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBRARIES}
+)
 add_dependencies(hovering_example ${catkin_EXPORTED_TARGETS})
 
 foreach(dir launch models resource worlds)
