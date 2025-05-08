@@ -1,0 +1,703 @@
+#include <thread>
+#include <chrono>
+#include <vector>
+#include <Eigen/Core>
+#include <mav_msgs/conversions.h>
+#include <mav_msgs/default_topics.h>
+#include <ros/ros.h>
+#include <std_srvs/Empty.h>
+#include <trajectory_msgs/MultiDOFJointTrajectory.h>
+#include <sensor_msgs/Image.h>
+#include <cv_bridge/cv_bridge.h>
+#include <image_transport/image_transport.h>
+#include <opencv2/aruco.hpp>
+#include <opencv2/opencv.hpp>
+#include <opencv2/highgui.hpp>
+#include <geometry_msgs/Pose.h>
+
+// 状态枚举定义整合
+enum FlightState {
+    INIT,
+    FIRST_WAYPOINT_SEQUENCE,
+    SEARCHING_ARUCO,
+    LANDING,
+    SECOND_WAYPOINT_SEQUENCE,
+    SEARCHING_APRON,
+    APPROACHING_APRON,
+    DESCENDING_APRON,
+    TOUCHING_APRON,
+    LANDED_APRON,
+    THIRD_WAYPOINT_SEQUENCE,  // 新增：前往第二个停机坪
+    SEARCHING_SECOND_APRON,   // 新增：寻找第二个停机坪
+    APPROACHING_SECOND_APRON, // 新增：接近第二个停机坪
+    DESCENDING_SECOND_APRON,  // 新增：第二次降落过程
+    TOUCHING_SECOND_APRON,    // 新增：第二次降落完成
+    COMPLETED
+  };
+
+class ArucoWaypointController {
+public:
+  ArucoWaypointController(ros::NodeHandle& nh) : nh_(nh), state_(INIT), aruco_detected_(false) {
+    // 创建发布器和订阅器
+    trajectory_pub_ = nh_.advertise<trajectory_msgs::MultiDOFJointTrajectory>(
+        mav_msgs::default_topics::COMMAND_TRAJECTORY, 10);
+    image_sub_ = nh_.subscribe("/hummingbird/vi_sensor/camera_depth/camera/image_raw", 1, 
+        &ArucoWaypointController::imageCallback, this);
+    pose_sub_ = nh_.subscribe("/hummingbird/ground_truth/pose", 1,
+        &ArucoWaypointController::poseCallback, this);
+    
+    initializeWaypoints();
+    
+    // 初始化配置参数
+    kp_horizontal_ = 0.0010;
+    kp_vertical_ = 0.0010;
+    
+    // 停机坪检测参数
+    debug_image_interval_ = 20;  // 增大间隔，减少文件保存
+    
+    // 目标着陆位置
+    target_landing_position_ = Eigen::Vector3d(2.2, 1.5, 2.0);
+  }
+
+  void start() {
+    unpauseGazebo();
+    ros::Duration(2.0).sleep();
+    state_ = FIRST_WAYPOINT_SEQUENCE;
+    executeFlightPlan();
+  }
+
+private:
+  // 核心ROS组件
+  ros::NodeHandle nh_;
+  ros::Publisher trajectory_pub_;
+  ros::Subscriber image_sub_;
+  ros::Subscriber pose_sub_;
+  
+  // 状态变量
+  FlightState state_;
+  bool aruco_detected_ = false;
+  bool apron_detected_ = false;
+  
+  // 位置信息
+  Eigen::Vector3d aruco_position_;
+  Eigen::Vector3d apron_position_;
+  Eigen::Vector3d current_drone_position_;
+  Eigen::Vector3d target_landing_position_;
+  
+  // 航点序列
+  std::vector<Eigen::Vector3d> first_waypoints_;
+  std::vector<double> first_yaws_;
+  std::vector<double> first_durations_;
+  std::vector<Eigen::Vector3d> second_waypoints_;
+  std::vector<double> second_yaws_;
+  std::vector<double> second_durations_;
+  
+  // 相机和控制参数
+  cv::Point2f marker_center_;
+  cv::Point2f apron_center_;
+  cv::Point2f image_center_;
+  double kp_horizontal_;
+  double kp_vertical_;
+  double current_height_ = 0.0;
+  double current_drone_yaw_ = 0.0;
+  
+  // 调试参数
+  int debug_image_interval_;
+  ros::Time last_apron_time_; // 记录最后一次检测到停机坪的时间
+
+  // 方法实现
+  void initializeWaypoints() {
+    // 第一段航点（ArUco检测之前）
+    first_waypoints_ = {
+        {0.0, 0.0, 1.6},
+        {3.0, 1.0, 1.6},
+        {3.0, 2.0, 1.6},
+        {1.0, 2.0, 1.6},
+        {1.0, 3.0, 1.6},
+        {3.0, 3.0, 1.6},
+        {3.0, 4.0, 1.6},
+        {1.0, 4.0, 1.6},
+        {1.0, 5.0, 1.6},
+        {3.0, 5.0, 1.6},
+        {3.0, 6.0, 1.6},
+        {0.3, 7.0, 1.6}
+    };
+    first_yaws_ = {0.0, 0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    first_durations_ = {0.5, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 2};
+
+    // 第二段航点
+    second_waypoints_ = {
+        {-2.6, 5.5, 1.7},
+        {-2.7, 5.4, 1.0},
+        {-3.3, 5.5, 1.0},
+        {-4.0, 5.5, 1.0},
+        {-4.0, 4.5, 1.0},
+        {-4.0, 3.5, 1.0},
+        {-4.0, 2.5, 1.0},
+        {-3.5, 1.5, 1.0},
+        {-2.7, 0.5, 1.0},
+        {-1.5, -0.5, 1.0},
+        {2.2, 1.45, 2.7}
+    };
+    second_yaws_ = {0.0, 0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    second_durations_ = {1, 1, 1, 0.5, 0.5, 0.5, 0.5, 0.5, 0.8, 1.2, 2};
+  }
+
+  void executeFlightPlan() {
+    while (state_ != COMPLETED && ros::ok()) {
+      ROS_INFO_THROTTLE(1.0, "Current state: %d", (int)state_);
+      
+      switch (state_) {
+        case FIRST_WAYPOINT_SEQUENCE:
+          {
+            ROS_INFO("Executing first waypoint sequence");
+            executeWaypoints(first_waypoints_, first_yaws_, first_durations_);
+            state_ = SEARCHING_ARUCO;
+            ROS_INFO("First waypoint sequence completed, searching for ArUco marker");
+          }
+          break;
+        
+        case LANDING:
+          {
+            ROS_INFO("ArUco marker detected, performing landing");
+            performLanding();
+            state_ = SECOND_WAYPOINT_SEQUENCE;  // 降落完成后转到下一阶段
+            ROS_INFO("ArUco landing completed, proceeding to second waypoint sequence");
+          }
+          break;
+        
+        case SECOND_WAYPOINT_SEQUENCE:
+          {
+            ROS_INFO("Executing second waypoint sequence");
+            executeWaypoints(second_waypoints_, second_yaws_, second_durations_);
+            state_ = SEARCHING_APRON;
+            ROS_INFO("Second waypoint sequence completed, searching for apron");
+          }
+          break;
+        
+        case THIRD_WAYPOINT_SEQUENCE:
+          {
+            // 前往第二个停机坪上方坐标
+            ROS_INFO("First landing successful, flying to second landing zone at [0.0, 0.0, 2.0]");
+            Eigen::Vector3d target_position(1.0, 0.2, 1.5);
+            
+            // 发布目标位置
+            publishTrajectory(target_position, current_drone_yaw_);
+            
+            // 等待足够时间到达目标位置
+            ros::Duration(3.0).sleep();
+            
+            // 检查是否接近目标位置
+            double dist_to_target = (current_drone_position_ - target_position).norm();
+            if (dist_to_target < 0.5) {
+              ROS_INFO("Reached second landing zone, position: [%.2f, %.2f, %.2f]", 
+                       current_drone_position_.x(), current_drone_position_.y(), current_drone_position_.z());
+              state_ = SEARCHING_SECOND_APRON;
+              apron_detected_ = false; // 重置停机坪检测标志
+            } else {
+              ROS_WARN("Failed to reach second landing zone, retrying...");
+              // 可以考虑增加重试计数或容错逻辑
+            }
+          }
+          break;
+          
+        case SEARCHING_SECOND_APRON:
+          if (searchTarget(10.0, apron_detected_)) {
+            state_ = APPROACHING_SECOND_APRON;
+            ROS_INFO("Second apron found, starting approach");
+          } else {
+            ROS_WARN("Second apron not found after timeout, mission aborted");
+            state_ = COMPLETED;
+          }
+          break;
+          
+        case APPROACHING_APRON:
+        case DESCENDING_APRON:
+        case TOUCHING_APRON:
+          performApronLanding();
+          break;
+        
+        case APPROACHING_SECOND_APRON:
+        case DESCENDING_SECOND_APRON:
+        case TOUCHING_SECOND_APRON:
+          performApronLanding();
+          break;
+        
+        // 其他状态处理...
+        
+        default:
+          break;
+      }
+      
+      ros::spinOnce();
+      ros::Duration(0.1).sleep();
+    }
+}
+
+// 简化的目标搜索函数
+bool searchTarget(double timeout, bool& detected_flag) {
+  ros::Time start_time = ros::Time::now();
+  while (!detected_flag && ros::Time::now() - start_time < ros::Duration(timeout)) {
+    ros::spinOnce();
+    ros::Duration(0.1).sleep();
+  }
+  return detected_flag;
+}
+
+void performApronLanding() {
+    static int landing_stage = 0;
+    static ros::Time stage_start_time;
+    static const double ALIGNMENT_THRESHOLD = 5.0; // 精确对齐阈值
+    static Eigen::Vector3d aligned_position; // 保存对齐后的水平位置
+    static bool position_locked = false;
+    
+    // 判断当前是第一次还是第二次降落
+    bool is_first_landing = (state_ == APPROACHING_APRON || state_ == DESCENDING_APRON || 
+                           state_ == TOUCHING_APRON || state_ == LANDED_APRON);
+                           
+    // 设置不同的目标高度
+    const double TARGET_HEIGHT_FIRST = 1.9;  // 第一次降落目标高度
+    const double TARGET_HEIGHT_SECOND = 0.0; // 第二次降落目标高度
+    const double HEIGHT_TOLERANCE = 0.1;     // 高度误差容忍
+    
+    // 根据当前是第一次还是第二次降落确定目标高度
+    double target_height = is_first_landing ? TARGET_HEIGHT_FIRST : TARGET_HEIGHT_SECOND;
+    
+    switch (landing_stage) {
+      case 0:  // 初始化
+        ROS_INFO("%s apron landing initiated", is_first_landing ? "First" : "Second");
+        stage_start_time = ros::Time::now();
+        landing_stage = 1;
+        position_locked = false;
+        break;
+        
+      case 1:  // 图像对齐阶段 - 仅水平定位
+        {
+          // 检查是否能检测到停机坪
+          if (!apron_detected_) {
+            ROS_WARN_THROTTLE(1.0, "Apron not detected, hovering and waiting");
+            publishTrajectory(current_drone_position_, current_drone_yaw_);
+            break;
+          }
+          
+          // 计算图像中心与停机坪中心的偏差
+          double dx = apron_center_.x - image_center_.x; // 水平偏差
+          double dy = apron_center_.y - image_center_.y; // 垂直偏差
+          
+          // 检查是否已经足够对齐
+          if (std::abs(dx) < ALIGNMENT_THRESHOLD && std::abs(dy) < ALIGNMENT_THRESHOLD) {
+            ROS_INFO("Apron precisely centered (offset: %.1f, %.1f px), locking position", dx, dy);
+            // 记录当前对齐的水平位置，用于后续下降
+            aligned_position = current_drone_position_;
+            position_locked = true; // 锁定位置
+            landing_stage = 2;
+            state_ = is_first_landing ? DESCENDING_APRON : DESCENDING_SECOND_APRON;
+            break;
+          }
+          
+          // 图像伺服控制增益系数
+          double gain = 0.0015; 
+          
+          // 计算当前高度下的实际移动量
+          double move_y = -dx * gain * current_height_; // 左右移动
+          double move_x = -dy * gain * current_height_; // 前后移动
+          
+          // 计算目标位置 - 只调整水平位置
+          Eigen::Vector3d target_position(
+            current_drone_position_.x() + move_x,
+            current_drone_position_.y() + move_y,
+            current_drone_position_.z()
+          );
+          
+          publishTrajectory(target_position, current_drone_yaw_);
+          
+          ROS_INFO_THROTTLE(1.0, "Centering on apron: dx=%.1f, dy=%.1f, moving [x=%.3f, y=%.3f]", 
+                           dx, dy, move_x, move_y);
+        }
+        break;
+        
+      case 2:  // 垂直运动阶段 - 移动到目标高度
+        {
+          // 检查是否已达到目标高度(±0.1误差范围)
+          if (std::abs(current_height_ - target_height) <= HEIGHT_TOLERANCE) {
+            ROS_INFO("Reached target height: %.2f m (target: %.2f ± %.2f)",
+                    current_height_, target_height, HEIGHT_TOLERANCE);
+            landing_stage = 3;
+            stage_start_time = ros::Time::now();
+            state_ = is_first_landing ? TOUCHING_APRON : TOUCHING_SECOND_APRON;
+            break;
+          }
+          
+          // 确定移动方向 - 上升或下降
+          double height_diff = current_height_ - target_height;
+          bool need_descend = (height_diff > 0);
+          
+          // 统一速率移动
+          double move_speed = 0.12; // 固定速度
+          double move_z = need_descend ? -move_speed : move_speed;
+          
+          // 计算新位置 - 锁定水平位置，只调整高度
+          Eigen::Vector3d target_position(
+            aligned_position.x(),
+            aligned_position.y(),
+            current_drone_position_.z() + move_z
+          );
+          
+          publishTrajectory(target_position, current_drone_yaw_);
+          
+          ROS_INFO_THROTTLE(1.0, "%s to target: current=%.2f, target=%.2f, diff=%.2f", 
+                          need_descend ? "Descending" : "Ascending",
+                          current_height_, target_height, height_diff);
+        }
+        break;
+        
+      case 3:  // 完成降落
+        {
+          // 短暂稳定在当前位置
+          publishTrajectory(current_drone_position_, current_drone_yaw_);
+          
+          // 等待稳定期
+          if (ros::Time::now() - stage_start_time > ros::Duration(3.0)) {
+            ROS_INFO("%s landing completed!", is_first_landing ? "First apron" : "Second apron");
+            landing_stage = 0; // 重置状态便于下次使用
+            
+            if (is_first_landing) {
+              state_ = THIRD_WAYPOINT_SEQUENCE; // 第一次降落后进入第三航段
+            } else {
+              state_ = COMPLETED; // 第二次降落后任务完成
+              ROS_INFO("Full mission completed successfully!");
+            }
+          }
+        }
+        break;
+    }
+}
+
+// 辅助函数：发布轨迹消息
+void publishTrajectory(const Eigen::Vector3d& position, double yaw) {
+  trajectory_msgs::MultiDOFJointTrajectory trajectory_msg;
+  mav_msgs::msgMultiDofJointTrajectoryFromPositionYaw(position, yaw, &trajectory_msg);
+  trajectory_msg.header.stamp = ros::Time::now();
+  trajectory_pub_.publish(trajectory_msg);
+}
+
+// 简化下降速度函数
+double getDescentSpeed(double height) {
+  return 0.08; // 固定较快的下降速度
+}
+
+bool detectApron(const cv::Mat& image, cv::Point2f& center) {
+  // 记住最后一次检测的有效位置
+  static bool last_detection_valid = false;
+  static cv::Point2f last_valid_center;
+  static Eigen::Vector3d aligned_position; // 保存对齐后的水平位置
+  static bool position_locked = false;
+  
+  // 在位置锁定后直接返回上次有效的中心点
+  if (position_locked && last_detection_valid) {
+    center = last_valid_center;
+    return true;
+  }
+  
+  // 颜色过滤 - 现在改为提取白色区域(H标记)
+  cv::Mat gray, binary;
+  cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+  
+  // 使用自适应阈值提取白色区域
+  cv::adaptiveThreshold(gray, binary, 255, cv::ADAPTIVE_THRESH_MEAN_C, 
+                       cv::THRESH_BINARY, 11, 2);
+
+  // 形态学操作清理噪点
+  cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+  cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
+  cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
+  
+  // 查找轮廓
+  std::vector<std::vector<cv::Point>> contours;
+  cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+  
+  // 结果图像（调试用）
+  cv::Mat result = image.clone();
+  
+  // 找到最大的白色轮廓
+  int max_contour_idx = -1;
+  double max_contour_area = 0;
+  for (int i = 0; i < contours.size(); i++) {
+    double area = cv::contourArea(contours[i]);
+    if (area > max_contour_area && area > 500) { // 最小面积阈值
+      max_contour_area = area;
+      max_contour_idx = i;
+    }
+  }
+  
+  // 如果找到合适的轮廓
+  if (max_contour_idx >= 0) {
+    // 获取轮廓外接矩形
+    cv::Rect bounding_rect = cv::boundingRect(contours[max_contour_idx]);
+    
+    // 检查是否接近H形状(仅作为参考)
+    cv::Point2f contour_center(
+      bounding_rect.x + bounding_rect.width/2.0f,
+      bounding_rect.y + bounding_rect.height/2.0f
+    );
+    
+    // 可视化检测结果
+    cv::drawContours(result, contours, max_contour_idx, cv::Scalar(0, 255, 0), 2);
+    cv::circle(result, contour_center, 5, cv::Scalar(255, 0, 0), -1);
+    cv::rectangle(result, bounding_rect, cv::Scalar(0, 0, 255), 2);
+    
+    // 保存调试图像
+    static int image_count = 0;
+    cv::imwrite("/tmp/apron_detection_new_" + std::to_string(image_count++) + ".jpg", result);
+    
+    // 返回中心点
+    center = contour_center;
+    last_valid_center = center;
+    last_detection_valid = true;
+    return true;
+  }
+  else if (last_detection_valid && current_height_ < 1.5) {
+    // 如果在低高度且之前检测到过，继续使用最后的有效位置
+    center = last_valid_center;
+    ROS_WARN_THROTTLE(1.0, "Using last valid apron position");
+    return true;
+  }
+  
+  last_detection_valid = false;
+  return false;
+}
+
+  void imageCallback(const sensor_msgs::ImageConstPtr& msg) {
+    cv_bridge::CvImagePtr cv_ptr;
+    try {
+      cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+    } catch (cv_bridge::Exception& e) {
+      ROS_ERROR("cv_bridge exception: %s", e.what());
+      return;
+    }
+    
+    cv::Mat image = cv_ptr->image;
+    image_center_ = cv::Point2f(image.cols / 2.0, image.rows / 2.0);
+    
+    // 根据当前状态选择检测方法
+    if (state_ == SEARCHING_ARUCO || state_ == LANDING) {
+      // ArUco 检测代码
+      cv::Ptr<cv::aruco::Dictionary> dictionary = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_250);
+      std::vector<int> ids;
+      std::vector<std::vector<cv::Point2f>> corners;
+      cv::aruco::detectMarkers(image, dictionary, corners, ids);
+      
+      // 绘制检测结果
+      cv::Mat output_image = image.clone();
+      cv::aruco::drawDetectedMarkers(output_image, corners, ids);
+      
+      if (ids.size() > 0) {
+        // 找到了ArUco标记
+        // 提取标记角点和中心
+        std::vector<cv::Point2f> marker_corners = corners[0];
+        marker_center_ = cv::Point2f(0, 0);
+        for (auto& corner : marker_corners) {
+          marker_center_ += corner;
+        }
+        marker_center_ *= 0.25f; // 取平均得到中心点
+        
+        // 打印标记中心点像素坐标
+        ROS_INFO_THROTTLE(1.0, "marker_center_pixel: (%.2f, %.2f)", marker_center_.x, marker_center_.y);
+        ROS_INFO_THROTTLE(1.0, "image_center_pixel: (%.2f, %.2f)", image_center_.x, image_center_.y);
+        
+        // 使用实际的vi_sensor相机内参
+        cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) << 
+                             205.46963709898583, 0.0, 320.5, 
+                             0.0, 205.46963709898583, 240.5, 
+                             0.0, 0.0, 1.0);
+        cv::Mat dist_coeffs = cv::Mat::zeros(5, 1, CV_64F); // 无畸变
+        
+        // 计算姿态和位置
+        std::vector<cv::Vec3d> rvecs, tvecs;
+        cv::aruco::estimatePoseSingleMarkers(
+            std::vector<std::vector<cv::Point2f>>{marker_corners},
+            0.1, // 标记大小(米)
+            camera_matrix, 
+            dist_coeffs,
+            rvecs, 
+            tvecs);
+
+        // 使用drawAxis可视化姿态
+        cv::aruco::drawAxis(output_image, camera_matrix, dist_coeffs,
+                         rvecs[0], tvecs[0], 0.05);
+
+        // 计算相对偏移 - 垂直向下相机
+        double marker_dx = tvecs[0][0];  // 相机x → 无人机前进
+        double marker_dy = -tvecs[0][1]; // 相机y → 无人机右侧，取负得到左侧
+        double marker_dz = -tvecs[0][2]; // 相机z → 无人机下方，取负得到高度
+
+        // 考虑yaw角的旋转
+        double cos_yaw = cos(current_drone_yaw_);
+        double sin_yaw = sin(current_drone_yaw_);
+
+        // 旋转到世界坐标系
+        double world_dx = cos_yaw * marker_dx - sin_yaw * marker_dy;
+        double world_dy = sin_yaw * marker_dx + cos_yaw * marker_dy;
+
+        // 假设期望位置
+        Eigen::Vector3d expected_aruco_position(0.4, 6.8, 0.0);
+
+        // 计算原始位置（不含补偿）
+        Eigen::Vector3d raw_aruco_position(
+            current_drone_position_.x() + world_dx,
+            current_drone_position_.y() + world_dy,
+            0.0
+        );
+
+        // 记录第一次检测的偏差
+        static bool first_detection = true;
+        static Eigen::Vector3d offset_vector;
+
+        if (first_detection && !aruco_detected_ && state_ == SEARCHING_ARUCO) {
+            // 计算偏差 = 期望位置 - 原始位置
+            offset_vector = expected_aruco_position - raw_aruco_position;
+            first_detection = false;
+            
+            ROS_INFO("Calculated correction offset: [%.2f, %.2f, %.2f]",
+                     offset_vector.x(), offset_vector.y(), offset_vector.z());
+        }
+
+        // 应用偏差修正
+        aruco_position_ = raw_aruco_position + offset_vector;
+
+        ROS_INFO_THROTTLE(1.0, "camera_offset: dx=%.4f, dy=%.4f, dz=%.4f", 
+                  tvecs[0][0], tvecs[0][1], tvecs[0][2]);
+        ROS_INFO_THROTTLE(1.0, "world_offset: dx=%.4f, dy=%.4f", world_dx, world_dy);
+        ROS_INFO_THROTTLE(1.0, "final_aruco_position: [%.2f, %.2f, %.2f]", 
+                 aruco_position_.x(), aruco_position_.y(), aruco_position_.z());
+        
+        // 首次检测到标记
+        if (!aruco_detected_ && state_ == SEARCHING_ARUCO) {
+          ROS_INFO("ArUco marker detected!");
+          aruco_detected_ = true;
+          state_ = LANDING;
+        }
+      }
+    } 
+    else if (state_ == SEARCHING_APRON || state_ == APPROACHING_APRON || 
+             state_ == DESCENDING_APRON || state_ == TOUCHING_APRON ||
+             state_ == SEARCHING_SECOND_APRON || state_ == APPROACHING_SECOND_APRON || 
+             state_ == DESCENDING_SECOND_APRON || state_ == TOUCHING_SECOND_APRON) {
+      
+      // 统一的停机坪检测逻辑，适用于两个停机坪
+      cv::Point2f detected_center;
+      if (detectApron(image, detected_center)) {
+        // 找到停机坪 - 更新中心点
+        apron_center_ = detected_center;
+        
+        // 计算并显示偏差（仅供调试）
+        double dx = apron_center_.x - image_center_.x;
+        double dy = apron_center_.y - image_center_.y;
+        
+        ROS_INFO_THROTTLE(1.0, "Apron detected: center=(%.1f, %.1f), offset=[%.1f, %.1f]",
+                  apron_center_.x, apron_center_.y, dx, dy);
+        
+        // 首次检测到停机坪
+        if (!apron_detected_) {
+          if (state_ == SEARCHING_APRON) {
+            ROS_INFO("First apron detected! Beginning approach");
+            apron_detected_ = true;
+            state_ = APPROACHING_APRON;
+          } 
+          else if (state_ == SEARCHING_SECOND_APRON) {
+            ROS_INFO("Second apron detected! Beginning approach");
+            apron_detected_ = true;
+            state_ = APPROACHING_SECOND_APRON;
+          }
+        }
+      } else {
+        // 未检测到停机坪
+        if ((state_ != SEARCHING_APRON && state_ != SEARCHING_SECOND_APRON) && 
+            ros::Time::now() - last_apron_time_ > ros::Duration(2.0)) {
+          ROS_WARN_THROTTLE(1.0, "Lost apron for over 2 seconds");
+          apron_detected_ = false;
+        }
+      }
+      
+      // 记录最后一次检测到停机坪的时间
+      if (apron_detected_) {
+        last_apron_time_ = ros::Time::now();
+      }
+    }
+  }
+
+  void poseCallback(const geometry_msgs::Pose::ConstPtr& msg) {
+    current_drone_position_ = Eigen::Vector3d(msg->position.x, msg->position.y, msg->position.z);
+    
+    // 从四元数计算 yaw 角
+    double qx = msg->orientation.x;
+    double qy = msg->orientation.y;
+    double qz = msg->orientation.z;
+    double qw = msg->orientation.w;
+    current_drone_yaw_ = atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
+    
+    current_height_ = msg->position.z;
+  }
+
+  void unpauseGazebo() {
+    ros::ServiceClient unpause_client = nh_.serviceClient<std_srvs::Empty>("/gazebo/unpause_physics");
+    std_srvs::Empty srv;
+    unpause_client.call(srv);
+  }
+
+  void executeWaypoints(const std::vector<Eigen::Vector3d>& waypoints, const std::vector<double>& yaws, const std::vector<double>& durations) {
+    for (size_t i = 0; i < waypoints.size(); ++i) {
+      publishTrajectory(waypoints[i], yaws[i]);
+      ros::Duration(durations[i]).sleep();
+    }
+  }
+
+  void performLanding() {
+    ROS_INFO("ArUco marker detected at [%.1f, %.1f, %.1f], performing landing",
+             aruco_position_.x(), aruco_position_.y(), aruco_position_.z());
+    
+    // 计算降落点（ArUco上方）
+    Eigen::Vector3d landing_position = aruco_position_;
+    landing_position.z() = aruco_position_.z() + 0.5; // 悬停在ArUco上方0.5米
+    
+    // 先飞到降落点上方
+    publishTrajectory(landing_position, current_drone_yaw_);
+    
+    // 等待到达降落点上方
+    ros::Duration(3.0).sleep();
+    
+    // 基于ArUco中心位置与图像中心的偏差计算水平校正
+    double dx = marker_center_.x - image_center_.x;
+    double dy = marker_center_.y - image_center_.y;
+  
+    // 水平位置PID控制 (使用已有的辅助函数)
+    landing_position.x() += -kp_vertical_ * dy;    // 前后校正
+    landing_position.y() += kp_horizontal_ * dx;   // 左右校正
+    
+    // 执行降落
+    landing_position.z() = 0.1; // 降低到接近地面
+    publishTrajectory(landing_position, current_drone_yaw_);
+    
+    // 等待降落完成
+    ros::Duration(5.0).sleep();
+    
+    // 起飞继续任务
+    Eigen::Vector3d takeoff_position = landing_position;
+    takeoff_position.z() = 1.0; // 起飞高度
+    publishTrajectory(takeoff_position, current_drone_yaw_);
+    
+    // 等待起飞完成
+    ros::Duration(3.0).sleep();
+  }
+};
+
+int main(int argc, char** argv) {
+  ros::init(argc, argv, "aruco_waypoint_controller");
+  ros::NodeHandle nh;
+  
+  ArucoWaypointController controller(nh);
+  controller.start();
+  
+  ros::spin();
+  return 0;
+}
